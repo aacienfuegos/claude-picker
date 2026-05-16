@@ -56,8 +56,8 @@ claude -p ...   # passes through directly, no picker
 |-----|--------|
 | `1`–`5` | Resume that session |
 | `n` | New session in this project |
-| `m` | Move a session to another project (`m2`, then pick target) |
-| `r` | Rename a session (`r1`, then choose AI suggestion or type) |
+| `m` | Move a session — prompted for which one, then pick target project |
+| `r` | Rename a session — prompted for which one, then choose AI suggestion or type manually |
 | `b` | Back to project picker |
 | `q` | Cancel |
 
@@ -73,23 +73,9 @@ claude -p ...   # passes through directly, no picker
 
 AI-generated names are cached in `~/.cache/claude-picker/`. Delete files there to regenerate them.
 
-## Generating project names in bulk
+## Project names
 
-Project names are not generated at startup (to keep it fast). To pre-generate all of them:
-
-```python
-from pathlib import Path
-import sys
-sys.path.insert(0, str(Path.home() / ".local/bin"))
-import importlib.util, importlib.machinery
-
-spec = importlib.util.spec_from_file_location("picker", Path.home() / ".local/bin/claude-picker")
-m = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(m)
-m.fill_ai_project_names(m.load_projects())
-```
-
-Or just rename each project interactively with `r` in the project picker.
+Project names are not generated at startup to keep it fast. They are generated on demand when you use `r` (rename) in the project picker — you can accept one of the AI suggestions or type your own.
 
 ## License
 
