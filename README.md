@@ -7,21 +7,26 @@ A session picker for [Claude Code](https://claude.ai/code) that intercepts the `
 
   #   Última sesión   Ses.  Nombre                        Directorio
   ────────────────────────────────────────────────────────────────────────
-  1   16 May 12:23    5     Setup Ubuntu timon            ~/
-  2   16 May 18:41    0     ~/tripplanner
+  n   nuevo proyecto                                      ~/my-new-app
+  ────────────────────────────────────────────────────────────────────────
+  1   17 May 10:14    3     claude-picker                 ~/claude-picker
+  2   16 May 18:41    5     Setup Ubuntu timon            ~/
+  3   16 May 12:23    9     Trip planner Next.js          ~/tripplanner
   ──────────────────────────────────────────────
   r   Renombrar proyecto   q   Cancelar
 
-  Elige proyecto [1-2/r/q]:
+  Elige proyecto [1-3/r/q/n]:
 ```
 
 ## Features
 
 - **Two-level picker**: choose project first, then session
+- **Smart current directory**: if you run `claude` in a directory with no prior sessions, it appears at the top as a quick-start entry (`n`)
 - **AI-generated summaries** for each session (cached, generated via `claude -p --model haiku`)
 - **AI-generated project names** (on demand, cached)
 - **Rename** projects and sessions — pick from AI suggestions or type manually
 - **Move** sessions between projects
+- **Stale project filtering**: projects whose directories no longer exist are automatically hidden
 - No extra dependencies — pure Python 3.10+, uses your existing `claude` CLI
 
 ## Requirements
@@ -66,6 +71,7 @@ claude -p ...   # passes through directly, no picker
 | Key | Action |
 |-----|--------|
 | `1`–`9` | Open that project |
+| `n` | Start a new session in the current directory (shown when it has no prior sessions) |
 | `r` | Rename a project |
 | `q` | Cancel |
 
