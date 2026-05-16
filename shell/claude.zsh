@@ -25,6 +25,7 @@ claude() {
       else
         (cd "$target_dir" 2>/dev/null && command claude)
       fi
+      (claude-picker --index >/dev/null 2>&1 &)
       return
     fi
     # exit_code 0 → no projects found, fall through to plain claude

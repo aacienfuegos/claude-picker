@@ -88,11 +88,12 @@ def _clean(text: str) -> str:
 
 # ── session data ──────────────────────────────────────────────────────────────
 
-def extract_session_data(session_file: Path) -> tuple[str, str, int, list]:
+def extract_session_data(session_file: Path) -> tuple[str, str, int, list, str]:
     candidates: list[str] = []
     exchanges:  list[tuple[str, str]] = []
     timestamp = ""
     user_count = 0
+    ai_title = ""
 
     try:
         with open(session_file) as f:
@@ -107,7 +108,10 @@ def extract_session_data(session_file: Path) -> tuple[str, str, int, list]:
 
                 msg_type = msg.get("type")
 
-                if msg_type == "user":
+                if msg_type == "ai-title":
+                    ai_title = msg.get("aiTitle", "")
+
+                elif msg_type == "user":
                     user_count += 1
                     if not timestamp:
                         timestamp = msg.get("timestamp", "")
@@ -136,7 +140,7 @@ def extract_session_data(session_file: Path) -> tuple[str, str, int, list]:
         except ValueError:
             ts_str = timestamp[:16]
 
-    return summary, ts_str, user_count, exchanges
+    return summary, ts_str, user_count, exchanges, ai_title
 
 
 # ── AI summaries ──────────────────────────────────────────────────────────────
@@ -188,28 +192,12 @@ def generate_ai_summary(session_id: str, exchanges: list, fallback: str) -> str:
 
 
 def fill_ai_summaries(sessions: list[dict]) -> None:
-    needs_ai = [s for s in sessions if not get_cached_summary(s["id"])]
-    if needs_ai:
-        sys.stderr.write("  Generando resúmenes")
-        sys.stderr.flush()
-        results: dict[str, str] = {}
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = {
-                executor.submit(generate_ai_summary, s["id"], s["exchanges"], s["summary"]): s["id"]
-                for s in needs_ai
-            }
-            for future in as_completed(futures):
-                results[futures[future]] = future.result()
-                sys.stderr.write(".")
-                sys.stderr.flush()
-        sys.stderr.write("\r" + " " * 35 + "\r")
-        sys.stderr.flush()
-        for s in sessions:
-            if s["id"] in results:
-                s["summary"] = results[s["id"]]
-    else:
-        for s in sessions:
-            s["summary"] = get_cached_summary(s["id"]) or s["summary"]
+    """Populate summaries from cache and ai-title only — no Haiku calls."""
+    for s in sessions:
+        if not get_cached_summary(s["id"]) and s.get("ai_title"):
+            save_cached_summary(s["id"], s["ai_title"])
+    for s in sessions:
+        s["summary"] = get_cached_summary(s["id"]) or s["summary"]
 
 
 # ── AI project names ──────────────────────────────────────────────────────────
@@ -226,18 +214,51 @@ def save_cached_project_name(dir_name: str, name: str) -> None:
     (CACHE_DIR / f"project_{dir_name}.txt").write_text(name)
 
 
-def generate_ai_project_name(dir_name: str, topic_hints: list[str], fallback: str) -> str:
+def get_git_context(real_path: str) -> str:
+    parts = []
+    try:
+        r = subprocess.run(
+            ["git", "-C", real_path, "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if r.returncode == 0:
+            url = r.stdout.strip()
+            repo = url.rstrip("/").split("/")[-1].removesuffix(".git")
+            if repo:
+                parts.append(f"Repositorio: {repo}")
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    try:
+        r = subprocess.run(
+            ["git", "-C", real_path, "log", "--oneline", "-5"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            parts.append("Commits recientes:\n" + r.stdout.strip())
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return "\n".join(parts)
+
+
+def generate_ai_project_name(dir_name: str, topic_hints: list[str], real_path: str, fallback: str) -> str:
     cached = get_cached_project_name(dir_name)
     if cached:
         return cached
-    if not topic_hints:
+
+    context_parts = []
+    if topic_hints:
+        context_parts.append("Conversaciones recientes:\n" + "\n".join(f"- {h}" for h in topic_hints[:5]))
+    git_ctx = get_git_context(real_path)
+    if git_ctx:
+        context_parts.append(git_ctx)
+    if not context_parts:
         return fallback
 
     prompt = (
-        "Lee estos fragmentos de conversaciones de un mismo proyecto y escribe un nombre "
+        "Lee este contexto de un proyecto y escribe un nombre "
         "muy corto (máximo 4 palabras) que describa el proyecto. "
         "Solo el nombre, sin puntuación al final, en el mismo idioma que las frases.\n\n"
-        + "\n".join(f"- {h}" for h in topic_hints[:5])
+        + "\n\n".join(context_parts)
         + "\n\nNombre del proyecto:"
     )
     try:
@@ -251,29 +272,44 @@ def generate_ai_project_name(dir_name: str, topic_hints: list[str], fallback: st
 
 
 def fill_ai_project_names(projects: list[dict]) -> None:
-    """Generate AI project names in parallel. Call this outside of the interactive loop."""
-    needs_ai = [p for p in projects if not get_cached_project_name(p["dir_name"]) and p["topic_hints"]]
+    needs_ai = [p for p in projects if not get_cached_project_name(p["dir_name"])]
     if needs_ai:
-        sys.stderr.write("  Generando nombres de proyecto")
-        sys.stderr.flush()
-        results: dict[str, str] = {}
         with ThreadPoolExecutor(max_workers=5) as executor:
             futures = {
-                executor.submit(generate_ai_project_name, p["dir_name"], p["topic_hints"], p["name"]): p["dir_name"]
+                executor.submit(
+                    generate_ai_project_name,
+                    p["dir_name"], p["topic_hints"], p["real_path"], p["name"],
+                ): p["dir_name"]
                 for p in needs_ai
             }
             for future in as_completed(futures):
-                results[futures[future]] = future.result()
-                sys.stderr.write(".")
-                sys.stderr.flush()
-        sys.stderr.write("\r" + " " * 40 + "\r")
-        sys.stderr.flush()
-        for p in projects:
-            if p["dir_name"] in results:
-                p["name"] = results[p["dir_name"]]
-    else:
-        for p in projects:
-            p["name"] = get_cached_project_name(p["dir_name"]) or p["name"]
+                future.result()
+
+
+def index_all() -> None:
+    """Background indexer: cache ai-titles + generate Haiku names for sessions and projects."""
+    projects = load_projects()
+    needs_session_ai: list[dict] = []
+
+    for p in projects:
+        sessions = load_sessions(p["dir"])
+        for s in sessions:
+            if not get_cached_summary(s["id"]) and s.get("ai_title"):
+                save_cached_summary(s["id"], s["ai_title"])
+        for s in sessions:
+            if not get_cached_summary(s["id"]):
+                needs_session_ai.append(s)
+
+    if needs_session_ai:
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(generate_ai_summary, s["id"], s["exchanges"], s["summary"]): s["id"]
+                for s in needs_session_ai
+            }
+            for future in as_completed(futures):
+                future.result()
+
+    fill_ai_project_names(projects)
 
 
 # ── rename ────────────────────────────────────────────────────────────────────
@@ -347,7 +383,7 @@ def show_rename_dialog(label: str, current_name: str, context: str, mode: str) -
 def load_sessions(project_dir: Path) -> list[dict]:
     sessions = []
     for f in project_dir.glob("*.jsonl"):
-        summary, timestamp, msg_count, exchanges = extract_session_data(f)
+        summary, timestamp, msg_count, exchanges, ai_title = extract_session_data(f)
         sessions.append({
             "id":        f.stem,
             "file":      f,
@@ -355,6 +391,7 @@ def load_sessions(project_dir: Path) -> list[dict]:
             "timestamp": timestamp,
             "msg_count": msg_count,
             "exchanges": exchanges,
+            "ai_title":  ai_title,
             "mtime":     f.stat().st_mtime,
         })
     sessions = [s for s in sessions if s["msg_count"] > 0]
@@ -377,7 +414,11 @@ def load_projects() -> list[dict]:
             continue
         last_mtime  = sessions[0]["mtime"]     if sessions else d.stat().st_mtime
         last_ts     = sessions[0]["timestamp"] if sessions else ""
-        topic_hints = [s["summary"] for s in sessions[:5] if s["summary"] not in ("(sin mensajes)", "")]
+        topic_hints = [
+            s.get("ai_title") or s["summary"]
+            for s in sessions[:5]
+            if (s.get("ai_title") or s["summary"]) not in ("(sin mensajes)", "")
+        ]
         disp        = display_path(real_path)
         projects.append({
             "dir":           d,
@@ -616,6 +657,10 @@ def show_session_picker(sessions_initial: list[dict], project: dict, all_project
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    if "--index" in sys.argv:
+        index_all()
+        return
+
     cwd      = os.getcwd()
     projects = load_projects()
     if not projects:
