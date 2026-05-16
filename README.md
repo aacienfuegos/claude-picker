@@ -38,7 +38,7 @@ A session picker for [Claude Code](https://claude.ai/code) that intercepts the `
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/claude-picker.git
+git clone https://github.com/aacienfuegos/claude-picker.git
 cd claude-picker
 bash install.sh
 source ~/.zshrc
