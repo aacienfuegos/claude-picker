@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(journalctl *)",
+      "Bash(dpkg -l *)",
+      "Bash(systemctl status *)",
+      "Bash(glxinfo *)",
+      "Bash(lspci *)",
+      "Bash(lsmod *)",
+      "Bash(xrandr *)",
+      "Bash(modinfo *)"
+    ]
+  }
+}
