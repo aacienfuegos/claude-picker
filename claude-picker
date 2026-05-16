@@ -589,21 +589,21 @@ def main():
     if not projects:
         sys.exit(0)
 
-    # If cwd has no project entry yet, prepend a synthetic one so the user
-    # can start a session there without being forced into another project.
+    # If cwd has no project history yet, ask before showing the full picker.
     if not any(p["real_path"] == cwd for p in projects):
-        disp = display_path(cwd)
-        projects.insert(0, {
-            "dir":           PROJECTS_ROOT / path_to_project_dir(cwd),
-            "dir_name":      path_to_project_dir(cwd),
-            "real_path":     cwd,
-            "display":       disp,
-            "name":          get_cached_project_name(path_to_project_dir(cwd)) or disp,
-            "session_count": 0,
-            "last_mtime":    0,
-            "last_ts":       "",
-            "topic_hints":   [],
-        })
+        err = sys.stderr
+        err.write(f"\n  {BOLD}{display_path(cwd)}{RESET} {DIM}no tiene sesiones anteriores.{RESET}\n\n")
+        err.write(f"  {GREEN}n{RESET}  Nueva sesión aquí\n")
+        err.write(f"  {DIM}p{RESET}  Abrir otro proyecto\n")
+        err.write(f"  {DIM}q{RESET}  Cancelar\n\n")
+        err.flush()
+        ch = wait_key("  [n/p/q]: ", "npq")
+        if ch is None or ch == "q":
+            sys.exit(2)
+        if ch == "n":
+            print(f"\t{cwd}")
+            sys.exit(1)
+        # ch == "p" → fall through to project picker
 
     while True:
         project = show_project_picker(projects, cwd)
