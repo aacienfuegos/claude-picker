@@ -589,6 +589,22 @@ def main():
     if not projects:
         sys.exit(0)
 
+    # If cwd has no project entry yet, prepend a synthetic one so the user
+    # can start a session there without being forced into another project.
+    if not any(p["real_path"] == cwd for p in projects):
+        disp = display_path(cwd)
+        projects.insert(0, {
+            "dir":           PROJECTS_ROOT / path_to_project_dir(cwd),
+            "dir_name":      path_to_project_dir(cwd),
+            "real_path":     cwd,
+            "display":       disp,
+            "name":          get_cached_project_name(path_to_project_dir(cwd)) or disp,
+            "session_count": 0,
+            "last_mtime":    0,
+            "last_ts":       "",
+            "topic_hints":   [],
+        })
+
     while True:
         project = show_project_picker(projects, cwd)
         if project is None:
