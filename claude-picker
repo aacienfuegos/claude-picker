@@ -1,0 +1,614 @@
+#!/usr/bin/env python3
+"""Session picker for Claude Code - two-level: project → session."""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import termios
+import tty
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
+
+CACHE_DIR     = Path.home() / ".cache" / "claude-picker"
+PROJECTS_ROOT = Path.home() / ".claude" / "projects"
+HOME          = str(Path.home())
+
+RESET  = "\033[0m"
+BOLD   = "\033[1m"
+DIM    = "\033[2m"
+CYAN   = "\033[36m"
+YELLOW = "\033[33m"
+GREEN  = "\033[32m"
+BLUE   = "\033[34m"
+
+
+# ── path helpers ──────────────────────────────────────────────────────────────
+
+def path_to_project_dir(cwd: str) -> str:
+    return cwd.replace("/", "-")
+
+
+def project_dir_to_path(dir_name: str) -> str:
+    """Reconstruct the real filesystem path from a project dir name.
+
+    Claude stores sessions under ~/.claude/projects/<cwd.replace("/","-")>.
+    Directories whose names contain "-" are ambiguous, but this naive reverse
+    works correctly for the overwhelming majority of paths.
+    """
+    naive = "/" + dir_name[1:].replace("-", "/")
+    if os.path.isdir(naive):
+        return naive
+    return naive
+
+
+def display_path(real_path: str) -> str:
+    if real_path.startswith(HOME):
+        return "~" + real_path[len(HOME):]
+    return real_path
+
+
+# ── text extraction ───────────────────────────────────────────────────────────
+
+def _extract_text(content) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text", "").strip()
+                if text:
+                    return text
+    return ""
+
+
+def _clean(text: str) -> str:
+    for line in text.splitlines():
+        line = line.strip()
+        if line:
+            text = line
+            break
+    else:
+        text = text.strip()
+    m = re.search(r'[.?!](?=\s|$)', text)
+    if m and m.start() > 0:
+        text = text[: m.end()]
+    return " ".join(text.split())
+
+
+# ── session data ──────────────────────────────────────────────────────────────
+
+def extract_session_data(session_file: Path) -> tuple[str, str, int, list]:
+    candidates: list[str] = []
+    exchanges:  list[tuple[str, str]] = []
+    timestamp = ""
+    user_count = 0
+
+    try:
+        with open(session_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                msg_type = msg.get("type")
+
+                if msg_type == "user":
+                    user_count += 1
+                    if not timestamp:
+                        timestamp = msg.get("timestamp", "")
+                    if len(exchanges) < 6 or len(candidates) < 5:
+                        text = _extract_text(msg.get("message", {}).get("content", ""))
+                        if text:
+                            if len(candidates) < 5:
+                                candidates.append(_clean(text))
+                            if len(exchanges) < 6:
+                                exchanges.append(("user", text[:300]))
+
+                elif msg_type == "assistant" and len(exchanges) < 6:
+                    text = _extract_text(msg.get("message", {}).get("content", ""))
+                    if text:
+                        exchanges.append(("assistant", text[:300]))
+    except (OSError, IOError):
+        pass
+
+    summary = next((c for c in candidates if len(c) >= 20), candidates[0] if candidates else "")
+
+    ts_str = ""
+    if timestamp:
+        try:
+            dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            ts_str = dt.astimezone().strftime("%d %b %H:%M")
+        except ValueError:
+            ts_str = timestamp[:16]
+
+    return summary, ts_str, user_count, exchanges
+
+
+# ── AI summaries ──────────────────────────────────────────────────────────────
+
+def get_cached_summary(session_id: str) -> str | None:
+    cache_file = CACHE_DIR / f"{session_id}.txt"
+    if cache_file.exists():
+        return cache_file.read_text().strip() or None
+    return None
+
+
+def save_cached_summary(session_id: str, summary: str) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    (CACHE_DIR / f"{session_id}.txt").write_text(summary)
+
+
+def _call_haiku(prompt: str) -> str:
+    result = subprocess.run(
+        ["claude", "-p", "--model", "haiku", "--no-session-persistence"],
+        input=prompt, capture_output=True, text=True, timeout=20,
+    )
+    if result.returncode == 0:
+        return result.stdout.strip()
+    return ""
+
+
+def generate_ai_summary(session_id: str, exchanges: list, fallback: str) -> str:
+    cached = get_cached_summary(session_id)
+    if cached:
+        return cached
+    if not exchanges:
+        return fallback
+
+    lines = [("Usuario" if r == "user" else "Asistente") + ": " + t for r, t in exchanges]
+    prompt = (
+        "Lee estos primeros mensajes de una conversación y escribe un título muy corto "
+        "(máximo 6 palabras) que describa el tema principal. "
+        "Solo el título, sin puntuación al final, en el mismo idioma que la conversación.\n\n"
+        + "\n".join(lines) + "\n\nTítulo:"
+    )
+    try:
+        summary = _call_haiku(prompt)
+        if summary:
+            save_cached_summary(session_id, summary)
+            return summary
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return fallback
+
+
+def fill_ai_summaries(sessions: list[dict]) -> None:
+    needs_ai = [s for s in sessions if not get_cached_summary(s["id"])]
+    if needs_ai:
+        sys.stderr.write("  Generando resúmenes")
+        sys.stderr.flush()
+        results: dict[str, str] = {}
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(generate_ai_summary, s["id"], s["exchanges"], s["summary"]): s["id"]
+                for s in needs_ai
+            }
+            for future in as_completed(futures):
+                results[futures[future]] = future.result()
+                sys.stderr.write(".")
+                sys.stderr.flush()
+        sys.stderr.write("\r" + " " * 35 + "\r")
+        sys.stderr.flush()
+        for s in sessions:
+            if s["id"] in results:
+                s["summary"] = results[s["id"]]
+    else:
+        for s in sessions:
+            s["summary"] = get_cached_summary(s["id"]) or s["summary"]
+
+
+# ── AI project names ──────────────────────────────────────────────────────────
+
+def get_cached_project_name(dir_name: str) -> str | None:
+    cache_file = CACHE_DIR / f"project_{dir_name}.txt"
+    if cache_file.exists():
+        return cache_file.read_text().strip() or None
+    return None
+
+
+def save_cached_project_name(dir_name: str, name: str) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    (CACHE_DIR / f"project_{dir_name}.txt").write_text(name)
+
+
+def generate_ai_project_name(dir_name: str, topic_hints: list[str], fallback: str) -> str:
+    cached = get_cached_project_name(dir_name)
+    if cached:
+        return cached
+    if not topic_hints:
+        return fallback
+
+    prompt = (
+        "Lee estos fragmentos de conversaciones de un mismo proyecto y escribe un nombre "
+        "muy corto (máximo 4 palabras) que describa el proyecto. "
+        "Solo el nombre, sin puntuación al final, en el mismo idioma que las frases.\n\n"
+        + "\n".join(f"- {h}" for h in topic_hints[:5])
+        + "\n\nNombre del proyecto:"
+    )
+    try:
+        name = _call_haiku(prompt)
+        if name:
+            save_cached_project_name(dir_name, name)
+            return name
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return fallback
+
+
+def fill_ai_project_names(projects: list[dict]) -> None:
+    """Generate AI project names in parallel. Call this outside of the interactive loop."""
+    needs_ai = [p for p in projects if not get_cached_project_name(p["dir_name"]) and p["topic_hints"]]
+    if needs_ai:
+        sys.stderr.write("  Generando nombres de proyecto")
+        sys.stderr.flush()
+        results: dict[str, str] = {}
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(generate_ai_project_name, p["dir_name"], p["topic_hints"], p["name"]): p["dir_name"]
+                for p in needs_ai
+            }
+            for future in as_completed(futures):
+                results[futures[future]] = future.result()
+                sys.stderr.write(".")
+                sys.stderr.flush()
+        sys.stderr.write("\r" + " " * 40 + "\r")
+        sys.stderr.flush()
+        for p in projects:
+            if p["dir_name"] in results:
+                p["name"] = results[p["dir_name"]]
+    else:
+        for p in projects:
+            p["name"] = get_cached_project_name(p["dir_name"]) or p["name"]
+
+
+# ── rename ────────────────────────────────────────────────────────────────────
+
+def read_text_input(prompt: str) -> str | None:
+    sys.stderr.write(prompt)
+    sys.stderr.flush()
+    try:
+        line = sys.stdin.readline().strip()
+        return line if line else None
+    except (EOFError, KeyboardInterrupt):
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+        return None
+
+
+def generate_ai_name_options(context: str, mode: str) -> list[str]:
+    """Generate 3 name suggestions. mode='session' or 'project'."""
+    if mode == "session":
+        prompt = (
+            "Lee estos mensajes y propón 3 títulos cortos (máximo 6 palabras cada uno) "
+            "para esta conversación. Un título por línea, sin numeración ni puntuación, "
+            "en el mismo idioma.\n\n" + context + "\n\nTítulos:"
+        )
+    else:
+        prompt = (
+            "Lee estos fragmentos y propón 3 nombres cortos (máximo 4 palabras cada uno) "
+            "para este proyecto. Un nombre por línea, sin numeración ni puntuación, "
+            "en el mismo idioma.\n\n" + context + "\n\nNombres:"
+        )
+    try:
+        output = _call_haiku(prompt)
+        lines = [re.sub(r'^[\d.\-*\s]+', '', l).strip()
+                 for l in output.splitlines() if l.strip()]
+        return [l for l in lines if l][:3]
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return []
+
+
+def show_rename_dialog(label: str, current_name: str, context: str, mode: str) -> str | None:
+    err = sys.stderr
+    err.write(f"\n  Renombrar {label}: {DIM}{truncate(current_name, 50)}{RESET}\n\n")
+    err.write("  Generando sugerencias…")
+    err.flush()
+
+    options = generate_ai_name_options(context, mode)
+
+    err.write("\r" + " " * 30 + "\r")
+    err.flush()
+
+    err.write(f"  {CYAN}m{RESET}  Escribir manualmente\n")
+    for i, opt in enumerate(options, 1):
+        err.write(f"  {CYAN}{i}{RESET}  {opt}\n")
+    err.write(f"  {DIM}b  Cancelar{RESET}\n\n")
+    err.flush()
+
+    valid = "m" + "".join(str(i) for i in range(1, len(options) + 1)) + "b"
+    opts_str = "/".join(["m"] + [str(i) for i in range(1, len(options) + 1)] + ["b"])
+    ch = wait_key(f"  Elige [{opts_str}]: ", valid)
+
+    if ch is None or ch == "b":
+        return None
+    if ch == "m":
+        return read_text_input("  Nuevo nombre: ")
+    return options[int(ch) - 1]
+
+
+# ── data loaders ──────────────────────────────────────────────────────────────
+
+def load_sessions(project_dir: Path) -> list[dict]:
+    sessions = []
+    for f in project_dir.glob("*.jsonl"):
+        summary, timestamp, msg_count, exchanges = extract_session_data(f)
+        sessions.append({
+            "id":        f.stem,
+            "file":      f,
+            "summary":   summary or "(sin mensajes)",
+            "timestamp": timestamp,
+            "msg_count": msg_count,
+            "exchanges": exchanges,
+            "mtime":     f.stat().st_mtime,
+        })
+    sessions = [s for s in sessions if s["msg_count"] > 0]
+    sessions.sort(key=lambda x: x["mtime"], reverse=True)
+    return sessions[:5]
+
+
+def load_projects() -> list[dict]:
+    """Return all known projects (with or without sessions), most recent first."""
+    projects = []
+    if not PROJECTS_ROOT.exists():
+        return projects
+
+    for d in PROJECTS_ROOT.iterdir():
+        if not d.is_dir():
+            continue
+        sessions    = load_sessions(d)
+        real_path   = project_dir_to_path(d.name)
+        last_mtime  = sessions[0]["mtime"]     if sessions else d.stat().st_mtime
+        last_ts     = sessions[0]["timestamp"] if sessions else ""
+        topic_hints = [s["summary"] for s in sessions[:5] if s["summary"] not in ("(sin mensajes)", "")]
+        disp        = display_path(real_path)
+        projects.append({
+            "dir":           d,
+            "dir_name":      d.name,
+            "real_path":     real_path,
+            "display":       disp,
+            "name":          get_cached_project_name(d.name) or disp,
+            "session_count": len(sessions),
+            "last_mtime":    last_mtime,
+            "last_ts":       last_ts,
+            "topic_hints":   topic_hints,
+        })
+
+    projects.sort(key=lambda x: x["last_mtime"], reverse=True)
+    return projects
+
+
+# ── UI helpers ────────────────────────────────────────────────────────────────
+
+def truncate(text: str, width: int) -> str:
+    if len(text) <= width:
+        return text
+    return text[: width - 1] + "…"
+
+
+def read_key() -> str:
+    fd = sys.stdin.fileno()
+    try:
+        old = termios.tcgetattr(fd)
+    except termios.error:
+        line = sys.stdin.readline()
+        if not line:
+            raise EOFError
+        return line.strip()[:1]
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if not ch:
+            raise EOFError
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    return ch
+
+
+def wait_key(prompt: str, valid: str) -> str | None:
+    """Show prompt and return the first keypress in valid, or None on cancel."""
+    err = sys.stderr
+    err.write(prompt)
+    err.flush()
+    while True:
+        try:
+            ch = read_key().lower()
+        except (EOFError, KeyboardInterrupt):
+            err.write("\n")
+            err.flush()
+            return None
+        if ch == "\x03":  # Ctrl+C
+            err.write("\n")
+            err.flush()
+            return None
+        if ch in valid:
+            err.write(f"{ch}\n")
+            err.flush()
+            return ch
+
+
+# ── pickers ───────────────────────────────────────────────────────────────────
+
+def show_project_picker(projects: list[dict], current_cwd: str) -> dict | None:
+    err = sys.stderr
+
+    while True:
+        err.write(f"\n{BOLD}  Proyectos de Claude{RESET}\n\n")
+        err.write(f"  {DIM}{'#':<3} {'Última sesión':<14} {'Ses.':<5} {'Nombre':<28} Directorio{RESET}\n")
+        err.write(f"  {'─' * 72}\n")
+
+        for i, p in enumerate(projects, 1):
+            marker = f" {DIM}← aquí{RESET}" if p["real_path"] == current_cwd else ""
+            name   = truncate(p["name"], 26)
+            err.write(
+                f"  {CYAN}{i:<3}{RESET}"
+                f" {YELLOW}{p['last_ts'] or '—':<14}{RESET}"
+                f" {DIM}{p['session_count']:<5}{RESET}"
+                f" {BOLD}{name:<28}{RESET}"
+                f" {DIM}{p['display']}{RESET}{marker}\n"
+            )
+
+        err.write(f"  {DIM}{'─' * 50}\n")
+        err.write(f"  r   Renombrar proyecto   q   Cancelar{RESET}\n\n")
+        err.flush()
+
+        valid = "".join(str(i) for i in range(1, len(projects) + 1)) + "rq"
+        ch = wait_key(f"  Elige proyecto [1-{len(projects)}/r/q]: ", valid)
+
+        if ch is None or ch == "q":
+            return None
+        if ch.isdigit():
+            return projects[int(ch) - 1]
+
+        num_valid = "".join(str(i) for i in range(1, len(projects) + 1)) + "b"
+        num_ch = wait_key(f"  ¿Qué proyecto renombrar? [1-{len(projects)}/b]: ", num_valid)
+        if num_ch is None or num_ch == "b":
+            continue
+        proj    = projects[int(num_ch) - 1]
+        context = "\n".join(proj["topic_hints"]) or proj["display"]
+        new_name = show_rename_dialog("proyecto", proj["name"], context, "project")
+        if new_name:
+            save_cached_project_name(proj["dir_name"], new_name)
+            proj["name"] = new_name
+
+
+def move_session(session_file: Path, target_dir: Path) -> bool:
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        session_file.rename(target_dir / session_file.name)
+        return True
+    except OSError:
+        return False
+
+
+def show_move_target_picker(projects: list[dict], current_dir: Path) -> Path | None:
+    err = sys.stderr
+    available = [p for p in projects if p["dir"] != current_dir]
+
+    if not available:
+        err.write(f"\n  {DIM}No hay otros proyectos disponibles.{RESET}\n\n")
+        err.flush()
+        return None
+
+    err.write(f"\n{BOLD}  Mover sesión a:{RESET}\n\n")
+    for i, p in enumerate(available, 1):
+        err.write(
+            f"  {CYAN}{i:<3}{RESET}"
+            f" {BOLD}{truncate(p['name'], 28):<28}{RESET}"
+            f"  {DIM}{p['display']}{RESET}\n"
+        )
+    err.write(f"  {DIM}b   Cancelar{RESET}\n\n")
+    err.flush()
+
+    valid = "".join(str(i) for i in range(1, len(available) + 1)) + "b"
+    ch = wait_key(f"  Elige destino [1-{len(available)}/b]: ", valid)
+
+    if ch is None or ch == "b":
+        return None
+    return available[int(ch) - 1]["dir"]
+
+
+def show_session_picker(sessions_initial: list[dict], project: dict, all_projects: list[dict]) -> str | None:
+    """Returns session ID to resume, 'new', 'back', or None to quit."""
+    err      = sys.stderr
+    sessions = list(sessions_initial)
+
+    while True:
+        err.write(f"\n{BOLD}  Sesiones — {BLUE}{project['display']}{RESET}\n\n")
+        err.write(f"  {DIM}{'#':<3} {'Fecha':<14} {'Msgs':<6} Resumen{RESET}\n")
+        err.write(f"  {'─' * 60}\n")
+
+        for i, s in enumerate(sessions, 1):
+            err.write(
+                f"  {CYAN}{i:<3}{RESET}"
+                f" {YELLOW}{s['timestamp'] or '—':<14}{RESET}"
+                f" {DIM}{s['msg_count']:<6}{RESET}"
+                f" {truncate(s['summary'], 45)}\n"
+            )
+
+        err.write(f"  {DIM}{'─' * 50}\n")
+        err.write(f"  {'n':<3} Nueva   {'m':<3} Mover   {'r':<3} Renombrar   {'b':<3} Proyectos   {'q':<3} Cancelar{RESET}\n\n")
+        err.flush()
+
+        valid     = "".join(str(i) for i in range(1, len(sessions) + 1)) + "mnrbq"
+        nums      = "/".join(str(i) for i in range(1, len(sessions) + 1))
+        num_valid = "".join(str(i) for i in range(1, len(sessions) + 1)) + "b"
+        prompt_opts = f"{nums}/" if nums else ""
+        ch = wait_key(f"  Elige [{prompt_opts}m/n/r/b/q]: ", valid)
+
+        if ch is None or ch == "q":
+            return None
+        if ch == "b":
+            return "back"
+        if ch == "n":
+            return "new"
+        if ch.isdigit():
+            return sessions[int(ch) - 1]["id"]
+
+        if ch == "m" and sessions:
+            num_ch = wait_key(f"  ¿Qué sesión mover? [{nums}/b]: ", num_valid)
+            if num_ch is None or num_ch == "b":
+                continue
+            selected   = sessions[int(num_ch) - 1]
+            target_dir = show_move_target_picker(all_projects, project["dir"])
+            if target_dir is not None:
+                if move_session(selected["file"], target_dir):
+                    sessions = [s for s in sessions if s["id"] != selected["id"]]
+                    err.write(f"  {GREEN}Sesión movida.{RESET}\n")
+                else:
+                    err.write(f"  {DIM}Error al mover la sesión.{RESET}\n")
+                err.flush()
+
+        elif ch == "r" and sessions:
+            num_ch = wait_key(f"  ¿Qué sesión renombrar? [{nums}/b]: ", num_valid)
+            if num_ch is None or num_ch == "b":
+                continue
+            selected = sessions[int(num_ch) - 1]
+            context  = "\n".join(
+                ("Usuario" if role == "user" else "Asistente") + ": " + text
+                for role, text in selected["exchanges"]
+            )
+            new_name = show_rename_dialog("sesión", selected["summary"], context, "session")
+            if new_name:
+                save_cached_summary(selected["id"], new_name)
+                selected["summary"] = new_name
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    cwd      = os.getcwd()
+    projects = load_projects()
+    if not projects:
+        sys.exit(0)
+
+    while True:
+        project = show_project_picker(projects, cwd)
+        if project is None:
+            sys.exit(2)
+
+        sessions = load_sessions(project["dir"])
+        fill_ai_summaries(sessions)
+
+        result = show_session_picker(sessions, project, projects)
+
+        if result is None:
+            sys.exit(2)
+        if result == "back":
+            continue
+
+        # Output: SESSION_ID\tREAL_PATH  (tab-separated, read by the shell wrapper)
+        session_id = "" if result == "new" else result
+        print(f"{session_id}\t{project['real_path']}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
