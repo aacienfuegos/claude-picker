@@ -35,13 +35,21 @@ def project_dir_to_path(dir_name: str) -> str:
     """Reconstruct the real filesystem path from a project dir name.
 
     Claude stores sessions under ~/.claude/projects/<cwd.replace("/","-")>.
-    Directories whose names contain "-" are ambiguous, but this naive reverse
-    works correctly for the overwhelming majority of paths.
+    Since path separators and literal dashes both become "-", we try all
+    combinations and return the first one that exists on the filesystem.
+    Returns "" if no existing directory is found.
     """
-    naive = "/" + dir_name[1:].replace("-", "/")
-    if os.path.isdir(naive):
-        return naive
-    return naive
+    parts = dir_name[1:].split("-")  # strip leading "-", split on all dashes
+    n = len(parts)
+    # Each gap between adjacent parts is either "/" (separator) or "-" (literal).
+    # Iterate from all-slashes to all-dashes, returning the first existing dir.
+    for mask in range(1 << (n - 1)):
+        path = "/" + parts[0]
+        for i in range(1, n):
+            path += ("/" if mask & (1 << (i - 1)) else "-") + parts[i]
+        if os.path.isdir(path):
+            return path
+    return ""
 
 
 def display_path(real_path: str) -> str:
@@ -365,6 +373,8 @@ def load_projects() -> list[dict]:
             continue
         sessions    = load_sessions(d)
         real_path   = project_dir_to_path(d.name)
+        if not real_path:
+            continue
         last_mtime  = sessions[0]["mtime"]     if sessions else d.stat().st_mtime
         last_ts     = sessions[0]["timestamp"] if sessions else ""
         topic_hints = [s["summary"] for s in sessions[:5] if s["summary"] not in ("(sin mensajes)", "")]
@@ -444,7 +454,18 @@ def show_project_picker(projects: list[dict], current_cwd: str) -> dict | None:
         err.write(f"  {DIM}{'#':<3} {'Última sesión':<14} {'Ses.':<5} {'Nombre':<28} Directorio{RESET}\n")
         err.write(f"  {'─' * 72}\n")
 
-        for i, p in enumerate(projects, 1):
+        new_cwd_project = next((p for p in projects if p.get("new_cwd")), None)
+        existing = [p for p in projects if not p.get("new_cwd")]
+
+        if new_cwd_project:
+            err.write(
+                f"  {GREEN}{'n':<3}{RESET}"
+                f" {GREEN}{'nuevo proyecto':<48}{RESET}"
+                f" {new_cwd_project['display']}\n"
+            )
+            err.write(f"  {'─' * 72}\n")
+
+        for i, p in enumerate(existing, 1):
             marker = f" {DIM}← aquí{RESET}" if p["real_path"] == current_cwd else ""
             name   = truncate(p["name"], 26)
             err.write(
@@ -459,19 +480,23 @@ def show_project_picker(projects: list[dict], current_cwd: str) -> dict | None:
         err.write(f"  r   Renombrar proyecto   q   Cancelar{RESET}\n\n")
         err.flush()
 
-        valid = "".join(str(i) for i in range(1, len(projects) + 1)) + "rq"
-        ch = wait_key(f"  Elige proyecto [1-{len(projects)}/r/q]: ", valid)
+        num_keys = "".join(str(i) for i in range(1, len(existing) + 1))
+        valid = num_keys + "rq" + ("n" if new_cwd_project else "")
+        prompt = f"  Elige proyecto [{num_keys}/r/q" + ("/n" if new_cwd_project else "") + "]: "
+        ch = wait_key(prompt, valid)
 
         if ch is None or ch == "q":
             return None
+        if ch == "n" and new_cwd_project:
+            return new_cwd_project
         if ch.isdigit():
-            return projects[int(ch) - 1]
+            return existing[int(ch) - 1]
 
-        num_valid = "".join(str(i) for i in range(1, len(projects) + 1)) + "b"
-        num_ch = wait_key(f"  ¿Qué proyecto renombrar? [1-{len(projects)}/b]: ", num_valid)
+        num_valid = num_keys + "b"
+        num_ch = wait_key(f"  ¿Qué proyecto renombrar? [1-{len(existing)}/b]: ", num_valid)
         if num_ch is None or num_ch == "b":
             continue
-        proj    = projects[int(num_ch) - 1]
+        proj    = existing[int(num_ch) - 1]
         context = "\n".join(proj["topic_hints"]) or proj["display"]
         new_name = show_rename_dialog("proyecto", proj["name"], context, "project")
         if new_name:
@@ -504,14 +529,21 @@ def show_move_target_picker(projects: list[dict], current_dir: Path) -> Path | N
             f" {BOLD}{truncate(p['name'], 28):<28}{RESET}"
             f"  {DIM}{p['display']}{RESET}\n"
         )
+    err.write(f"  {GREEN}{'n':<3}{RESET} Nuevo proyecto\n")
     err.write(f"  {DIM}b   Cancelar{RESET}\n\n")
     err.flush()
 
-    valid = "".join(str(i) for i in range(1, len(available) + 1)) + "b"
-    ch = wait_key(f"  Elige destino [1-{len(available)}/b]: ", valid)
+    valid = "".join(str(i) for i in range(1, len(available) + 1)) + "nb"
+    ch = wait_key(f"  Elige destino [1-{len(available)}/n/b]: ", valid)
 
     if ch is None or ch == "b":
         return None
+    if ch == "n":
+        raw = read_text_input("  Ruta del nuevo proyecto (absoluta o ~/...): ")
+        if not raw:
+            return None
+        path = os.path.expanduser(raw.strip())
+        return PROJECTS_ROOT / path_to_project_dir(path)
     return available[int(ch) - 1]["dir"]
 
 
@@ -589,21 +621,21 @@ def main():
     if not projects:
         sys.exit(0)
 
-    # If cwd has no project history yet, ask before showing the full picker.
+    # If cwd has no project history yet, add it at the top as a "new project" entry.
     if not any(p["real_path"] == cwd for p in projects):
-        err = sys.stderr
-        err.write(f"\n  {BOLD}{display_path(cwd)}{RESET} {DIM}no tiene sesiones anteriores.{RESET}\n\n")
-        err.write(f"  {GREEN}n{RESET}  Nueva sesión aquí\n")
-        err.write(f"  {DIM}p{RESET}  Abrir otro proyecto\n")
-        err.write(f"  {DIM}q{RESET}  Cancelar\n\n")
-        err.flush()
-        ch = wait_key("  [n/p/q]: ", "npq")
-        if ch is None or ch == "q":
-            sys.exit(2)
-        if ch == "n":
-            print(f"\t{cwd}")
-            sys.exit(1)
-        # ch == "p" → fall through to project picker
+        disp = display_path(cwd)
+        projects.insert(0, {
+            "dir":           PROJECTS_ROOT / path_to_project_dir(cwd),
+            "dir_name":      path_to_project_dir(cwd),
+            "real_path":     cwd,
+            "display":       disp,
+            "name":          disp,
+            "session_count": 0,
+            "last_mtime":    0,
+            "last_ts":       "",
+            "topic_hints":   [],
+            "new_cwd":       True,
+        })
 
     while True:
         project = show_project_picker(projects, cwd)

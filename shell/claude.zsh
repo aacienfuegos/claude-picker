@@ -15,10 +15,15 @@ claude() {
       local session_id="${output%%$'\t'*}"
       local target_dir="${output##*$'\t'}"
 
+      if [[ ! -d "$target_dir" ]]; then
+        echo "claude-picker: el directorio '$target_dir' ya no existe" >&2
+        return 1
+      fi
+
       if [[ -n "$session_id" ]]; then
-        (cd "$target_dir" && command claude --resume "$session_id")
+        (cd "$target_dir" 2>/dev/null && command claude --resume "$session_id")
       else
-        (cd "$target_dir" && command claude)
+        (cd "$target_dir" 2>/dev/null && command claude)
       fi
       return
     fi
