@@ -656,32 +656,105 @@ def show_session_picker(sessions_initial: list[dict], project: dict, all_project
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
+def _make_cwd_entry(cwd: str) -> dict:
+    disp = display_path(cwd)
+    return {
+        "dir":           PROJECTS_ROOT / path_to_project_dir(cwd),
+        "dir_name":      path_to_project_dir(cwd),
+        "real_path":     cwd,
+        "display":       disp,
+        "name":          disp,
+        "session_count": 0,
+        "last_mtime":    0,
+        "last_ts":       "",
+        "topic_hints":   [],
+        "new_cwd":       True,
+    }
+
+
 def main():
-    if "--index" in sys.argv:
+    args = sys.argv[1:]
+
+    if "--index" in args:
         index_all()
         return
 
+    pick_project_mode = "--pick-project" in args
+    pick_session_mode = "--pick-session" in args
+
     cwd      = os.getcwd()
     projects = load_projects()
-    if not projects:
+    if not projects and not pick_project_mode and not pick_session_mode:
         sys.exit(0)
 
     # If cwd has no project history yet, add it at the top as a "new project" entry.
     if not any(p["real_path"] == cwd for p in projects):
-        disp = display_path(cwd)
-        projects.insert(0, {
-            "dir":           PROJECTS_ROOT / path_to_project_dir(cwd),
-            "dir_name":      path_to_project_dir(cwd),
-            "real_path":     cwd,
-            "display":       disp,
-            "name":          disp,
-            "session_count": 0,
-            "last_mtime":    0,
-            "last_ts":       "",
-            "topic_hints":   [],
-            "new_cwd":       True,
-        })
+        projects.insert(0, _make_cwd_entry(cwd))
 
+    # ── --pick-project: return selected project as JSON, no session picker ─────
+    if pick_project_mode:
+        project = show_project_picker(projects, cwd)
+        if project is None:
+            sys.exit(1)
+        print(json.dumps({
+            "real_path": project["real_path"],
+            "display":   project["display"],
+            "name":      project["name"],
+        }))
+        sys.exit(0)
+
+    # ── --pick-session: return selected project+session as JSON ────────────────
+    if pick_session_mode:
+        while True:
+            project = show_project_picker(projects, cwd)
+            if project is None:
+                sys.exit(1)
+
+            sessions = load_sessions(project["dir"])
+            fill_ai_summaries(sessions)
+
+            result = show_session_picker(sessions, project, projects)
+
+            if result is None:
+                sys.exit(1)
+            if result == "back":
+                continue
+
+            session_id = "" if result == "new" else result
+            summary = ""
+            if session_id:
+                match = next((s for s in sessions if s["id"] == session_id), None)
+                if match:
+                    summary = match.get("summary", "")
+            print(json.dumps({
+                "session_id": session_id,
+                "real_path":  project["real_path"],
+                "display":    project["display"],
+                "name":       project["name"],
+                "summary":    summary,
+            }))
+            sys.exit(0)
+
+    # ── default: choose mode, then launch claude ──────────────────────────────
+    err = sys.stderr
+    err.write(f"\n{BOLD}  Claude{RESET}  {DIM}¿qué quieres hacer?{RESET}\n\n")
+    err.write(f"  {CYAN}p{RESET}  Abrir proyecto\n")
+    err.write(f"  {CYAN}s{RESET}  Continuar sesión\n")
+    err.write(f"  {DIM}q  Cancelar{RESET}\n\n")
+    err.flush()
+    mode_ch = wait_key("  Elige [p/s/q]: ", "psq")
+    if mode_ch is None or mode_ch == "q":
+        sys.exit(2)
+
+    if mode_ch == "p":
+        # Project-only: pick project, launch claude (new session) in that dir
+        project = show_project_picker(projects, cwd)
+        if project is None:
+            sys.exit(2)
+        print(f"\t{project['real_path']}")
+        sys.exit(1)
+
+    # mode_ch == "s": pick project then session
     while True:
         project = show_project_picker(projects, cwd)
         if project is None:

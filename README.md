@@ -55,6 +55,38 @@ claude          # shows the picker
 claude -p ...   # passes through directly, no picker
 ```
 
+### Machine-readable modes (for agent pipelines)
+
+Two flags make the picker output JSON to stdout instead of launching Claude.
+These are useful when you want another Claude agent to act on the selection.
+
+```bash
+# Pick a project — outputs JSON with the selected project, then exits
+claude-picker --pick-project
+# → {"real_path": "/home/user/myapp", "display": "~/myapp", "name": "My App"}
+
+# Pick a project and session — outputs JSON with both, then exits
+claude-picker --pick-session
+# → {"session_id": "abc123", "real_path": "/home/user/myapp",
+#    "display": "~/myapp", "name": "My App", "summary": "Fix auth bug"}
+#    session_id is "" when the user chose "new session"
+```
+
+**Exit codes** (both modes):
+- `0` — user made a selection (JSON written to stdout)
+- `1` — user cancelled (nothing written to stdout)
+
+A typical agent pipeline looks like:
+
+```bash
+selection=$(claude-picker --pick-session)
+if [[ $? -eq 0 ]]; then
+  session_id=$(echo "$selection" | python3 -c "import sys,json; print(json.load(sys.stdin)['session_id'])")
+  real_path=$(echo "$selection" | python3 -c "import sys,json; print(json.load(sys.stdin)['real_path'])")
+  # hand off to another agent...
+fi
+```
+
 ### Session picker keys
 
 | Key | Action |
